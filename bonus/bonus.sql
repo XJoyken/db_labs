@@ -62,236 +62,191 @@ CREATE TABLE audit_log (
 
 CREATE OR REPLACE FUNCTION process_transfer(
     p_from_account_number TEXT,
-    p_to_account_number TEXT,
-    p_amount NUMERIC,
-    p_currency TEXT,
-    p_description TEXT
-) RETURNS TEXT
-LANGUAGE plpgsql
-AS $$
+    p_to_account_number   TEXT,
+    p_amount              NUMERIC,
+    p_currency            TEXT,
+    p_description         TEXT,
+    p_ip_address          TEXT DEFAULT 'internal',
+    p_changed_by          TEXT DEFAULT 'system'
+)
+RETURNS TEXT AS $$
 DECLARE
-    v_from_account_id INT;
-    v_to_account_id INT;
-    v_from_customer_id INT;
-    v_from_status TEXT;
-    v_from_balance NUMERIC;
-    v_from_currency TEXT;
-    v_to_currency TEXT;
-    v_daily_limit NUMERIC;
-    v_today_trans_sum_kzt NUMERIC := 0;
-    v_rate_to_kzt NUMERIC;
-    v_amount_in_kzt NUMERIC;
-    v_exchange_rate_from_to NUMERIC;
-    v_amount_to NUMERIC;
-    v_trans_id INT;
-    v_old_json JSONB;
-    v_new_json JSONB;
-    v_ip_address TEXT := 'internal';
-    v_changed_by TEXT := 'system';
+    v_from_acc      RECORD;
+    v_to_acc        RECORD;
+    v_customer      RECORD;
+    v_rate_to_kzt   NUMERIC;
+    v_rate_cross    NUMERIC := 1;
+    v_amount_kzt    NUMERIC;
+    v_amount_to     NUMERIC;
+    v_today_out_kzt NUMERIC := 0;
+    v_trans_id      INT;
+    v_old_json      JSONB;
+    v_new_json      JSONB;
 BEGIN
-    -- Log attempt
     INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, changed_at, ip_address)
-    VALUES ('transactions', NULL, 'ATTEMPT_TRANSFER', jsonb_build_object(
-        'from_account_number', p_from_account_number,
-        'to_account_number', p_to_account_number,
-        'amount', p_amount,
-        'currency', p_currency,
-        'description', p_description
-    ), v_changed_by, CURRENT_TIMESTAMP, v_ip_address);
+    VALUES ('transactions', NULL, 'ATTEMPT_TRANSFER',
+            jsonb_build_object(
+                'from', p_from_account_number,
+                'to',   p_to_account_number,
+                'amount', p_amount,
+                'currency', p_currency,
+                'desc', p_description
+            ),
+            p_changed_by, CURRENT_TIMESTAMP, p_ip_address);
 
     BEGIN
-        -- Lock and fetch source account
-        SELECT account_id, customer_id, balance, currency
-        INTO v_from_account_id, v_from_customer_id, v_from_balance, v_from_currency
-        FROM accounts
-        WHERE account_number = p_from_account_number AND is_active = TRUE
-        FOR UPDATE;
+        SELECT account_id, customer_id, balance, currency, is_active
+          INTO STRICT v_from_acc
+          FROM accounts
+         WHERE account_number = p_from_account_number
+           FOR UPDATE;
 
-        IF NOT FOUND THEN
-            RAISE EXCEPTION '1001: Source account not found or inactive';
+        IF NOT v_from_acc.is_active THEN
+            RAISE EXCEPTION '1001: Source account inactive';
         END IF;
 
-        -- Check if currency matches source account currency
-        IF v_from_currency != p_currency THEN
-            RAISE EXCEPTION '1005: Transfer currency does not match source account currency';
+        IF v_from_acc.currency != p_currency THEN
+            RAISE EXCEPTION '1005: Currency mismatch for source account';
         END IF;
 
-        -- Lock and fetch destination account
-        SELECT account_id, currency
-        INTO v_to_account_id, v_to_currency
-        FROM accounts
-        WHERE account_number = p_to_account_number AND is_active = TRUE
-        FOR UPDATE;
+        SELECT account_id, currency, is_active
+          INTO STRICT v_to_acc
+          FROM accounts
+         WHERE account_number = p_to_account_number
+           FOR UPDATE;
 
-        IF NOT FOUND THEN
-            RAISE EXCEPTION '1002: Destination account not found or inactive';
+        IF NOT v_to_acc.is_active THEN
+            RAISE EXCEPTION '1002: Destination account inactive';
         END IF;
 
-        SAVEPOINT sp_after_locks;
+        SELECT status, daily_limit_kzt INTO STRICT v_customer
+          FROM customers WHERE customer_id = v_from_acc.customer_id;
 
-        -- Fetch sender customer status and daily limit
-        SELECT status, daily_limit_kzt
-        INTO v_from_status, v_daily_limit
-        FROM customers
-        WHERE customer_id = v_from_customer_id;
-
-        IF v_from_status != 'active' THEN
-            RAISE EXCEPTION '1003: Sender customer is not active';
+        IF v_customer.status != 'active' THEN
+            RAISE EXCEPTION '1003: Sender customer not active';
         END IF;
 
-        -- Check sufficient balance
-        IF v_from_balance < p_amount THEN
+        IF v_from_acc.balance < p_amount THEN
             RAISE EXCEPTION '1004: Insufficient balance';
         END IF;
 
-        -- Fetch exchange rate to KZT (for limit check)
-        IF v_from_currency = 'KZT' THEN
+        IF p_currency = 'KZT' THEN
             v_rate_to_kzt := 1;
         ELSE
-            SELECT rate INTO v_rate_to_kzt
-            FROM exchange_rates
-            WHERE from_currency = v_from_currency AND to_currency = 'KZT'
-            AND valid_from <= CURRENT_TIMESTAMP AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
-            ORDER BY valid_from DESC
-            LIMIT 1;
-
-            IF NOT FOUND THEN
-                RAISE EXCEPTION '1006: No exchange rate found to KZT';
-            END IF;
+            SELECT rate INTO STRICT v_rate_to_kzt
+              FROM exchange_rates
+             WHERE from_currency = p_currency AND to_currency = 'KZT'
+               AND valid_from <= CURRENT_TIMESTAMP
+               AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
+             ORDER BY valid_from DESC LIMIT 1;
         END IF;
 
-        v_amount_in_kzt := p_amount * v_rate_to_kzt;
+        v_amount_kzt := p_amount * v_rate_to_kzt;
 
-        -- Calculate today's outgoing transactions sum in KZT
-        SELECT COALESCE(SUM(amount_kzt), 0) INTO v_today_trans_sum_kzt
-        FROM transactions
-        WHERE from_account_id = v_from_account_id
-        AND created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + INTERVAL '1 day'
-        AND status = 'completed'
-        AND type = 'transfer';
+        SELECT COALESCE(SUM(amount_kzt), 0) INTO v_today_out_kzt
+          FROM transactions
+         WHERE from_account_id = v_from_acc.account_id
+           AND status = 'completed'
+           AND type = 'transfer'
+           AND created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + INTERVAL '1 day';
 
-        -- Check daily limit
-        IF v_today_trans_sum_kzt + v_amount_in_kzt > v_daily_limit THEN
-            RAISE EXCEPTION '1007: Daily transaction limit exceeded';
+        IF v_today_out_kzt + v_amount_kzt > v_customer.daily_limit_kzt THEN
+            RAISE EXCEPTION '1007: Daily limit exceeded';
         END IF;
 
-        -- Handle currency conversion if needed
-        IF v_from_currency = v_to_currency THEN
-            v_exchange_rate_from_to := 1;
-            v_amount_to := p_amount;
-        ELSE
-            SELECT rate INTO v_exchange_rate_from_to
-            FROM exchange_rates
-            WHERE from_currency = v_from_currency AND to_currency = v_to_currency
-            AND valid_from <= CURRENT_TIMESTAMP AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
-            ORDER BY valid_from DESC
-            LIMIT 1;
-
-            IF NOT FOUND THEN
-                RAISE EXCEPTION '1008: No exchange rate found for conversion';
-            END IF;
-
-            v_amount_to := p_amount * v_exchange_rate_from_to;
+        IF v_from_acc.currency != v_to_acc.currency THEN
+            SELECT rate INTO STRICT v_rate_cross
+              FROM exchange_rates
+             WHERE from_currency = v_from_acc.currency
+               AND to_currency = v_to_acc.currency
+               AND valid_from <= CURRENT_TIMESTAMP
+               AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
+             ORDER BY valid_from DESC LIMIT 1;
         END IF;
 
-        -- Insert pending transaction
+        v_amount_to := p_amount * v_rate_cross;
+
         INSERT INTO transactions (
-            from_account_id, to_account_id, amount, currency, exchange_rate,
-            amount_kzt, type, status, created_at, description
+            from_account_id, to_account_id,
+            amount, currency, exchange_rate, amount_kzt,
+            type, status, description, created_at
         ) VALUES (
-            v_from_account_id, v_to_account_id, p_amount, p_currency, v_exchange_rate_from_to,
-            v_amount_in_kzt, 'transfer', 'pending', CURRENT_TIMESTAMP, p_description
+            v_from_acc.account_id, v_to_acc.account_id,
+            p_amount, p_currency, v_rate_cross, v_amount_kzt,
+            'transfer', 'pending', p_description, CURRENT_TIMESTAMP
         ) RETURNING transaction_id INTO v_trans_id;
 
-        -- Log insert for transactions
+        -- Log insert
         SELECT row_to_json(t) INTO v_new_json
         FROM transactions t WHERE transaction_id = v_trans_id;
 
         INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, changed_at, ip_address)
-        VALUES ('transactions', v_trans_id, 'INSERT', NULL, v_new_json, v_changed_by, CURRENT_TIMESTAMP, v_ip_address);
+        VALUES ('transactions', v_trans_id, 'INSERT', NULL, v_new_json, p_changed_by, CURRENT_TIMESTAMP, p_ip_address);
 
-        -- Update source account balance
         SELECT row_to_json(a) INTO v_old_json
-        FROM accounts a WHERE account_id = v_from_account_id;
+        FROM accounts a WHERE account_id = v_from_acc.account_id;
 
         UPDATE accounts
-        SET balance = balance - p_amount
-        WHERE account_id = v_from_account_id;
+           SET balance = balance - p_amount
+         WHERE account_id = v_from_acc.account_id;
 
         SELECT row_to_json(a) INTO v_new_json
-        FROM accounts a WHERE account_id = v_from_account_id;
+        FROM accounts a WHERE account_id = v_from_acc.account_id;
 
         INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, changed_at, ip_address)
-        VALUES ('accounts', v_from_account_id, 'UPDATE', v_old_json, v_new_json, v_changed_by, CURRENT_TIMESTAMP, v_ip_address);
+        VALUES ('accounts', v_from_acc.account_id, 'UPDATE', v_old_json, v_new_json, p_changed_by, CURRENT_TIMESTAMP, p_ip_address);
 
-        SAVEPOINT sp_after_debit;
-
-        -- Update destination account balance
         SELECT row_to_json(a) INTO v_old_json
-        FROM accounts a WHERE account_id = v_to_account_id;
+        FROM accounts a WHERE account_id = v_to_acc.account_id;
 
         UPDATE accounts
-        SET balance = balance + v_amount_to
-        WHERE account_id = v_to_account_id;
+           SET balance = balance + v_amount_to
+         WHERE account_id = v_to_acc.account_id;
 
         SELECT row_to_json(a) INTO v_new_json
-        FROM accounts a WHERE account_id = v_to_account_id;
+        FROM accounts a WHERE account_id = v_to_acc.account_id;
 
         INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, changed_at, ip_address)
-        VALUES ('accounts', v_to_account_id, 'UPDATE', v_old_json, v_new_json, v_changed_by, CURRENT_TIMESTAMP, v_ip_address);
+        VALUES ('accounts', v_to_acc.account_id, 'UPDATE', v_old_json, v_new_json, p_changed_by, CURRENT_TIMESTAMP, p_ip_address);
 
-        -- Update transaction to completed
         SELECT row_to_json(t) INTO v_old_json
         FROM transactions t WHERE transaction_id = v_trans_id;
 
         UPDATE transactions
-        SET status = 'completed', completed_at = CURRENT_TIMESTAMP
-        WHERE transaction_id = v_trans_id;
+           SET status = 'completed',
+               completed_at = CURRENT_TIMESTAMP
+         WHERE transaction_id = v_trans_id;
 
         SELECT row_to_json(t) INTO v_new_json
         FROM transactions t WHERE transaction_id = v_trans_id;
 
         INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, changed_at, ip_address)
-        VALUES ('transactions', v_trans_id, 'UPDATE', v_old_json, v_new_json, v_changed_by, CURRENT_TIMESTAMP, v_ip_address);
+        VALUES ('transactions', v_trans_id, 'UPDATE', v_old_json, v_new_json, p_changed_by, CURRENT_TIMESTAMP, p_ip_address);
 
-    EXCEPTION WHEN OTHERS THEN
-        -- Error detection. Rollback if needed
-        IF SQLERRM LIKE '1001%' OR SQLERRM LIKE '1002%' OR SQLERRM LIKE '1003%'
-           OR SQLERRM LIKE '1005%' OR SQLERRM LIKE '1006%' OR SQLERRM LIKE '1008%' THEN
-            NULL;
-        ELSIF SQLERRM LIKE '1004%' OR SQLERRM LIKE '1007%' THEN
-            NULL;
-        ELSE
-            -- Datatype Mismatch or Data Exception
-            IF SQLSTATE = '42804' OR SQLSTATE = '22000' THEN
-                ROLLBACK TO SAVEPOINT sp_after_locks;
-            ELSE
-                BEGIN
-                    ROLLBACK TO SAVEPOINT sp_after_debit;
-                EXCEPTION WHEN OTHERS THEN
-                    NULL;
-                END;
-            END IF;
-        END IF;
+        RETURN 'SUCCESS: Transaction ID ' || v_trans_id;
 
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+        RAISE EXCEPTION '1006 or 1008: Exchange rate not found';
+
+    WHEN OTHERS THEN
         -- Log failure
         INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, changed_at, ip_address)
-        VALUES ('transactions', NULL, 'FAILED_TRANSFER', jsonb_build_object(
-            'from_account_number', p_from_account_number,
-            'to_account_number', p_to_account_number,
-            'amount', p_amount,
-            'currency', p_currency,
-            'description', p_description,
-            'error', SQLERRM
-        ), v_changed_by, CURRENT_TIMESTAMP, v_ip_address);
+        VALUES ('transactions', v_trans_id, 'FAILED_TRANSFER',
+                jsonb_build_object(
+                    'from', p_from_account_number,
+                    'to', p_to_account_number,
+                    'amount', p_amount,
+                    'currency', p_currency,
+                    'error', SQLERRM
+                ),
+                p_changed_by, CURRENT_TIMESTAMP, p_ip_address);
 
-        RETURN 'Error: ' || SQLERRM;
+        RETURN 'ERROR: ' || SQLERRM;
     END;
 
-    -- If successful
-    RETURN 'Success';
 END;
-$$;
+$$ LANGUAGE plpgsql;
+
 
 -- TASK 2
 
@@ -670,23 +625,22 @@ COMMENT ON INDEX idx_accounts_number_hash        IS '18% faster than B-tree on e
 
 -- TASK 4
 
--- Add parent_transaction_id for linking child transactions to batch
 ALTER TABLE transactions
 ADD COLUMN IF NOT EXISTS parent_transaction_id BIGINT DEFAULT NULL
 REFERENCES transactions(transaction_id) ON DELETE SET NULL;
 
--- Add new_values JSONB for storing metadata (e.g., batch results)
 ALTER TABLE transactions
 ADD COLUMN IF NOT EXISTS new_values JSONB DEFAULT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_transactions_parent_id
+ON transactions (parent_transaction_id);
 
 CREATE OR REPLACE FUNCTION process_salary_batch(
     p_company_account_number TEXT,
     p_payments JSONB,
     p_batch_description TEXT DEFAULT 'Monthly Salary Batch'
 )
-RETURNS JSONB
-LANGUAGE plpgsql
-AS $$
+RETURNS JSONB AS $$
 DECLARE
     v_company_acc     RECORD;
     v_total_amount    NUMERIC := 0;
@@ -697,11 +651,10 @@ DECLARE
     v_payment         RECORD;
     v_recipient_acc   RECORD;
     v_trans_id        INT;
-    v_rate_to_kzt     NUMERIC;
+    v_rate_to_kzt     NUMERIC := 1;
     v_amount_kzt      NUMERIC;
     v_batch_id        INT;
 BEGIN
-    -- Calculate total and validate input
     SELECT SUM((pay->>'amount')::NUMERIC) INTO v_total_amount
     FROM jsonb_array_elements(p_payments) AS pay;
 
@@ -715,32 +668,26 @@ BEGIN
         );
     END IF;
 
-    -- Lock company account and fetch it
-    -- Advisory lock: unique per company account number
     v_lock_key := ('x' || substr(md5('salary_batch_' || p_company_account_number), 1, 16))::bit(64)::bigint;
     PERFORM pg_advisory_xact_lock(v_lock_key);
 
     SELECT account_id, customer_id, balance, currency, is_active
-      INTO v_company_acc
+      INTO STRICT v_company_acc
       FROM accounts
      WHERE account_number = p_company_account_number
-       AND is_active = TRUE
        FOR UPDATE;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Company account % not found or inactive', p_company_account_number;
+    IF NOT v_company_acc.is_active THEN
+        RAISE EXCEPTION 'Company account inactive';
     END IF;
 
-    -- Check sufficient balance (convert if needed)
-    IF v_company_acc.currency = 'KZT' THEN
-        v_rate_to_kzt := 1;
-    ELSE
-        SELECT rate INTO v_rate_to_kzt
+    IF v_company_acc.currency != 'KZT' THEN
+        SELECT rate INTO STRICT v_rate_to_kzt
           FROM exchange_rates
          WHERE from_currency = v_company_acc.currency AND to_currency = 'KZT'
-           AND CURRENT_TIMESTAMP BETWEEN valid_from AND COALESCE(valid_to, 'infinity')
+           AND valid_from <= CURRENT_TIMESTAMP
+           AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
          ORDER BY valid_from DESC LIMIT 1;
-        IF NOT FOUND THEN RAISE EXCEPTION 'No exchange rate % → KZT', v_company_acc.currency; END IF;
     END IF;
 
     IF v_company_acc.balance < v_total_amount THEN
@@ -748,18 +695,14 @@ BEGIN
                v_total_amount, v_company_acc.currency, v_company_acc.balance;
     END IF;
 
-    -- Create batch record
     INSERT INTO transactions (
-        from_account_id, to_account_id, amount, currency, amount_kzt,
+        from_account_id, amount, currency, amount_kzt,
         type, status, description, created_at
-    )
-    VALUES (
-        v_company_acc.account_id, NULL, v_total_amount, v_company_acc.currency,
+    ) VALUES (
+        v_company_acc.account_id, v_total_amount, v_company_acc.currency,
         v_total_amount * v_rate_to_kzt, 'salary_batch', 'pending', p_batch_description, CURRENT_TIMESTAMP
-    )
-    RETURNING transaction_id INTO v_batch_id;
+    ) RETURNING transaction_id INTO v_batch_id;
 
-    -- Process each payment with SAVEPOINT (partial success allowed)
     FOR v_payment IN
         SELECT
             row_number() OVER () AS idx,
@@ -768,100 +711,73 @@ BEGIN
             pay->>'description'  AS description
         FROM jsonb_array_elements(p_payments) AS pay
     LOOP
-        SAVEPOINT payment_sp;
+        SELECT a.account_id, a.balance, a.currency
+          INTO STRICT v_recipient_acc
+          FROM accounts a
+          JOIN customers c ON a.customer_id = c.customer_id
+         WHERE c.iin = v_payment.iin
+           AND a.is_active = TRUE
+         ORDER BY a.opened_at DESC LIMIT 1
+           FOR UPDATE;
 
-        BEGIN
-            -- Find recipient account by IIN (assume most recent opened account for salary)
-            SELECT a.account_id, a.balance, a.currency
-              INTO v_recipient_acc
-              FROM accounts a
-              JOIN customers c ON a.customer_id = c.customer_id
-             WHERE c.iin = v_payment.iin
-               AND a.is_active = TRUE
-             ORDER BY a.opened_at DESC
-             LIMIT 1
-               FOR UPDATE;
+        v_amount_kzt := v_payment.amount * v_rate_to_kzt;
 
-            IF NOT FOUND THEN
-                RAISE EXCEPTION 'Recipient with IIN % not found or no active account', v_payment.iin;
-            END IF;
+        INSERT INTO transactions (
+            from_account_id, to_account_id, amount, currency, amount_kzt,
+            exchange_rate, type, status, description, created_at, parent_transaction_id
+        ) VALUES (
+            v_company_acc.account_id,
+            v_recipient_acc.account_id,
+            v_payment.amount,
+            v_company_acc.currency,
+            v_amount_kzt,
+            1, 'salary', 'pending', v_payment.description, CURRENT_TIMESTAMP,
+            v_batch_id
+        ) RETURNING transaction_id INTO v_trans_id;
 
-            -- Convert amount to KZT equivalent
-            v_amount_kzt := v_payment.amount * v_rate_to_kzt;
-
-            -- Insert individual salary transaction
-            INSERT INTO transactions (
-                from_account_id, to_account_id, amount, currency, amount_kzt,
-                exchange_rate, type, status, description, created_at, parent_transaction_id
-            ) VALUES (
-                v_company_acc.account_id,
-                v_recipient_acc.account_id,
-                v_payment.amount,
-                v_company_acc.currency,
-                v_amount_kzt,
-                1, 'salary', 'completed', v_payment.description, CURRENT_TIMESTAMP,
-                v_batch_id
-            ) RETURNING transaction_id INTO v_trans_id;
-
-            -- Success -> count
-            v_success_count := v_success_count + 1;
-
-        EXCEPTION WHEN OTHERS THEN
-            ROLLBACK TO SAVEPOINT payment_sp;
-
-            v_failed_count := v_failed_count + 1;
-            v_failed_details := v_failed_details || jsonb_build_object(
-                'index', v_payment.idx,
-                'iin', v_payment.iin,
-                'amount', v_payment.amount,
-                'error', SQLERRM
-            );
-        END;
+        v_success_count := v_success_count + 1;
     END LOOP;
 
-    -- Final atomic balance updates (only if any success)
     IF v_success_count > 0 THEN
-        -- Debit company once (total amount, even if partial failures)
         UPDATE accounts
-           SET balance = balance - (v_success_count::NUMERIC / jsonb_array_length(p_payments)::NUMERIC) * v_total_amount
+           SET balance = balance - v_total_amount
          WHERE account_id = v_company_acc.account_id;
 
-        -- Credit all recipients in bulk
         WITH credits AS (
-            SELECT
-                to_account_id,
-                SUM(amount) AS total_credit
+            SELECT to_account_id, SUM(amount) AS total_credit
             FROM transactions
             WHERE parent_transaction_id = v_batch_id
-              AND status = 'completed'
+              AND status = 'pending'
             GROUP BY to_account_id
         )
         UPDATE accounts a
            SET balance = a.balance + c.total_credit
           FROM credits c
          WHERE a.account_id = c.to_account_id;
+
+        UPDATE transactions
+           SET status = 'completed',
+               completed_at = CURRENT_TIMESTAMP
+         WHERE parent_transaction_id = v_batch_id;
     END IF;
 
-    -- Finalize batch transaction
     UPDATE transactions
        SET status = 'completed',
            completed_at = CURRENT_TIMESTAMP,
            new_values = jsonb_build_object(
                'successful_count', v_success_count,
-               'failed_count', v_failed_count,
-               'failed_details', v_failed_details,
-               'total_amount_processed', (v_success_count::NUMERIC / jsonb_array_length(p_payments)::NUMERIC) * v_total_amount
+               'failed_count', 0,
+               'total_amount_processed', v_total_amount
            )
      WHERE transaction_id = v_batch_id;
 
-    -- Return detailed result
     RETURN jsonb_build_object(
         'status', 'COMPLETED',
         'batch_id', v_batch_id,
         'successful_count', v_success_count,
-        'failed_count', v_failed_count,
-        'total_amount_processed', (v_success_count::NUMERIC / jsonb_array_length(p_payments)::NUMERIC) * v_total_amount,
-        'failed_details', v_failed_details
+        'failed_count', 0,
+        'total_amount_processed', v_total_amount,
+        'failed_details', '[]'::jsonb
     );
 
 EXCEPTION WHEN OTHERS THEN
@@ -869,7 +785,7 @@ EXCEPTION WHEN OTHERS THEN
         UPDATE transactions
            SET status = 'failed',
                new_values = jsonb_build_object('error', SQLERRM)
-         WHERE transaction_id = v_batch_id;
+         WHERE transaction_id = v_batch_id OR parent_transaction_id = v_batch_id;
     END IF;
 
     RETURN jsonb_build_object(
@@ -880,9 +796,8 @@ EXCEPTION WHEN OTHERS THEN
         'failed_details', '[]'::jsonb
     );
 END;
-$$;
+$$ LANGUAGE plpgsql;
 
--- Materialized View: Salary Batch Summary
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_salary_batch_summary AS
 SELECT
     t.transaction_id AS batch_id,
@@ -902,9 +817,3 @@ JOIN customers c ON a.customer_id = c.customer_id
 WHERE t.type = 'salary_batch'
   AND t.status = 'completed'
 ORDER BY t.created_at DESC;
-
--- Refresh command
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_salary_batch_summary;
-
-COMMENT ON MATERIALIZED VIEW mv_salary_batch_summary IS
-'HR & Compliance dashboard: monthly salary batch results with success rate';
